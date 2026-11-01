@@ -1,0 +1,60 @@
+type Payment {
+  id: ID!
+  idempotencyKey: String!
+  sourceAccountId: ID!
+  destAccountId: ID!
+  amount: String!
+  currency: String!
+  status: PaymentStatus!
+  failureReason: String
+  createdAt: AWSDateTime!
+  updatedAt: AWSDateTime!
+}
+
+type Account {
+  id: ID!
+  ownerId: String!
+  name: String!
+  currency: String!
+  balance: String!
+  createdAt: AWSDateTime!
+}
+
+type PaymentConnection {
+  items: [Payment!]!
+  nextToken: String
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+type Query {
+  getPayment(id: ID!): Payment
+  listPayments(accountId: ID!, limit: Int, nextToken: String): PaymentConnection!
+  getAccount(id: ID!): Account
+}
+
+type Mutation {
+  createPayment(input: CreatePaymentInput!): Payment!
+}
+
+# Real-time payment status pushed to connected clients via WebSocket.
+# AppSync manages the WebSocket connection; the Lambda resolver publishes
+# to the subscription whenever a payment status changes.
+type Subscription {
+  onPaymentStatusChanged(accountId: ID!): Payment
+    @aws_subscribe(mutations: ["createPayment"])
+}
+
+input CreatePaymentInput {
+  idempotencyKey: String!
+  sourceAccountId: ID!
+  destAccountId: ID!
+  amount: String!
+  currency: String!
+}

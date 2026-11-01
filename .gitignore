@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# Node / Frontend
+node_modules/
+frontend-app/dist/
+frontend-app/.env.local
+
+# SAM / CDK
+.aws-sam/
+samconfig.toml
+
+# Env
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp

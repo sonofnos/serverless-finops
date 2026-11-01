@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: serverless-finops — event-driven payment operations platform
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        DATABASE_URL: !Sub "postgresql://{{resolve:secretsmanager:finops/db:SecretString:username}}:{{resolve:secretsmanager:finops/db:SecretString:password}}@${RDSInstance.Endpoint.Address}:5432/finops"
+        PAYMENT_QUEUE_URL: !Ref PaymentQueue
+        AWS_REGION: !Ref AWS::Region
+    VpcConfig:
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      SubnetIds: !Ref PrivateSubnetIds
+
+Parameters:
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  DBPassword:
+    Type: String
+    NoEcho: true
+
+Resources:
+
+  # ── SQS ──────────────────────────────────────────────────────────────────────
+  PaymentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: payment-events.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PaymentDLQ.Arn
+        maxReceiveCount: 3
+
+  PaymentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: payment-events-dlq.fifo
+      FifoQueue: true
+
+  # ── Lambda: HTTP API handlers ─────────────────────────────────────────────────
+  PaymentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/handlers/payments.handler
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PaymentQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:finops/db*"
+      Events:
+        CreatePayment:
+          Type: HttpApi
+          Properties:
+            Path: /payments
+            Method: POST
+        GetPayment:
+          Type: HttpApi
+          Properties:
+            Path: /payments/{id}
+            Method: GET
+        ListPayments:
+          Type: HttpApi
+          Properties:
+            Path: /payments
+            Method: GET
+
+  AccountsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/handlers/accounts.handler
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:finops/db*"
+      Events:
+        CreateAccount:
+          Type: HttpApi
+          Properties:
+            Path: /accounts
+            Method: POST
+        GetAccount:
+          Type: HttpApi
+          Properties:
+            Path: /accounts/{id}
+            Method: GET
+
+  # ── Lambda: SQS consumer ──────────────────────────────────────────────────────
+  PaymentConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/consumers/payment_consumer.handler
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt PaymentQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:finops/db*"
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PaymentQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures  # partial batch failure support
+
+  # ── Lambda: Outbox publisher (EventBridge schedule) ───────────────────────────
+  OutboxPublisherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/consumers/outbox_publisher.handler
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt PaymentQueue.QueueName
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:finops/db*"
+      Events:
+        Schedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: "rate(10 seconds)"
+
+  # ── RDS (PostgreSQL) ──────────────────────────────────────────────────────────
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t4g.micro
+      Engine: postgres
+      EngineVersion: "16.3"
+      DBName: finops
+      MasterUsername: finops
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: "20"
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 7
+      MultiAZ: false
+      StorageEncrypted: true
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS
+      SubnetIds: !Ref PrivateSubnetIds
+
+  # ── Security groups ───────────────────────────────────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda to RDS
+      VpcId: !Ref VpcId
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS ingress from Lambda
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+Outputs:
+  ApiEndpoint:
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  PaymentQueueUrl:
+    Value: !Ref PaymentQueue
+  PaymentDLQUrl:
+    Value: !Ref PaymentDLQ
